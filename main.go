@@ -33,6 +33,8 @@ type Config struct {
 	EventHubName      string
 	GoroutineCount    int
 	IntervalSeconds   int
+	UseKafka          bool   // Whether to use Kafka API instead of AMQP
+	KafkaBroker       string // Kafka broker endpoint
 }
 
 // Static list of 100 SKU family names
@@ -85,23 +87,41 @@ func main() {
 	log.Printf("=== Configuration Loaded Successfully ===")
 	log.Printf("  Event Hub Namespace: %s", config.EventHubNamespace)
 	log.Printf("  Event Hub Name: %s", config.EventHubName)
+	log.Printf("  Use Kafka API: %t", config.UseKafka)
+	if config.UseKafka {
+		log.Printf("  Kafka Broker: %s", config.KafkaBroker)
+	}
 	log.Printf("  Goroutine Count: %d", config.GoroutineCount)
 	log.Printf("  Interval Seconds: %d", config.IntervalSeconds)
 	log.Printf("  Total SKU Families Available: %d", len(skuFamilies))
 
-	log.Println("Creating Event Hub client...")
-	// Create Event Hub client
-	client, err := createEventHubClient(config)
-	if err != nil {
-		log.Fatalf("FATAL: Failed to create Event Hub client: %v", err)
+	// Create producer client (either Event Hub AMQP or Kafka)
+	var producer EventProducer
+	var err2 error
+
+	if config.UseKafka {
+		log.Println("Creating Kafka producer client...")
+		producer, err2 = createKafkaProducer(config)
+		if err2 != nil {
+			log.Fatalf("FATAL: Failed to create Kafka producer client: %v", err2)
+		}
+		log.Println("SUCCESS: Kafka producer client created successfully")
+	} else {
+		log.Println("Creating Event Hub AMQP client...")
+		client, err2 := createEventHubClient(config)
+		if err2 != nil {
+			log.Fatalf("FATAL: Failed to create Event Hub client: %v", err2)
+		}
+		producer = &EventHubProducer{client: client}
+		log.Println("SUCCESS: Event Hub client created successfully")
 	}
-	log.Println("SUCCESS: Event Hub client created successfully")
+
 	defer func() {
-		log.Println("Closing Event Hub client...")
-		if err := client.Close(context.Background()); err != nil {
-			log.Printf("ERROR: Failed to close Event Hub client: %v", err)
+		log.Println("Closing producer client...")
+		if err := producer.Close(context.Background()); err != nil {
+			log.Printf("ERROR: Failed to close producer client: %v", err)
 		} else {
-			log.Println("SUCCESS: Event Hub client closed successfully")
+			log.Println("SUCCESS: Producer client closed successfully")
 		}
 	}()
 
@@ -128,7 +148,7 @@ func main() {
 			defer wg.Done()
 			ccpID := uuid.New().String()
 			log.Printf("DEBUG: Goroutine %d starting with CCP ID: %s", goroutineIndex+1, ccpID)
-			runEventGenerator(ctx, client, config, ccpID)
+			runEventGenerator(ctx, producer, config, ccpID)
 			log.Printf("DEBUG: Goroutine %d (CCP %s) finished", goroutineIndex+1, ccpID)
 		}(i)
 	}
@@ -161,10 +181,14 @@ func loadConfig() (*Config, error) {
 	config := &Config{
 		EventHubNamespace: os.Getenv("EVENT_HUB_NAMESPACE"),
 		EventHubName:      os.Getenv("EVENT_HUB_NAME"),
+		UseKafka:          os.Getenv("USE_KAFKA") == "true",
+		KafkaBroker:       os.Getenv("KAFKA_BROKER"),
 	}
 
 	log.Printf("DEBUG: EVENT_HUB_NAMESPACE=%s", config.EventHubNamespace)
 	log.Printf("DEBUG: EVENT_HUB_NAME=%s", config.EventHubName)
+	log.Printf("DEBUG: USE_KAFKA=%t", config.UseKafka)
+	log.Printf("DEBUG: KAFKA_BROKER=%s", config.KafkaBroker)
 
 	// Parse goroutine count
 	goroutineCountStr := os.Getenv("GOROUTINE_COUNT")
@@ -198,12 +222,25 @@ func loadConfig() (*Config, error) {
 
 	// Validate required fields
 	log.Println("DEBUG: Validating required configuration...")
-	if config.EventHubName == "" {
-		return nil, fmt.Errorf("EVENT_HUB_NAME is required but not set")
-	}
 
-	if config.EventHubNamespace == "" {
-		return nil, fmt.Errorf("EVENT_HUB_NAMESPACE is required but not set")
+	if config.UseKafka {
+		// Validate Kafka configuration
+		if config.KafkaBroker == "" {
+			return nil, fmt.Errorf("KAFKA_BROKER is required but not set when USE_KAFKA=true")
+		}
+		if config.EventHubName == "" {
+			return nil, fmt.Errorf("EVENT_HUB_NAME is required but not set (used as Kafka topic)")
+		}
+		log.Println("DEBUG: Kafka configuration validation passed")
+	} else {
+		// Validate Event Hub configuration
+		if config.EventHubName == "" {
+			return nil, fmt.Errorf("EVENT_HUB_NAME is required but not set")
+		}
+		if config.EventHubNamespace == "" {
+			return nil, fmt.Errorf("EVENT_HUB_NAMESPACE is required but not set")
+		}
+		log.Println("DEBUG: Event Hub configuration validation passed")
 	}
 
 	log.Println("DEBUG: Configuration validation passed")
@@ -254,8 +291,64 @@ func createEventHubClient(config *Config) (*azeventhubs.ProducerClient, error) {
 	return client, nil
 }
 
+// EventProducer is an interface for different event producer implementations
+type EventProducer interface {
+	SendEvents(ctx context.Context, events []SKUEvent, partitionKey string) (int, error)
+	Close(ctx context.Context) error
+}
+
+// EventHubProducer wraps the Event Hub producer client
+type EventHubProducer struct {
+	client *azeventhubs.ProducerClient
+}
+
+// SendEvents sends events to Event Hub using the AMQP protocol
+func (p *EventHubProducer) SendEvents(ctx context.Context, events []SKUEvent, partitionKey string) (int, error) {
+	// Create batch with partitionKey as partition key
+	batchOptions := &azeventhubs.EventDataBatchOptions{
+		PartitionKey: &partitionKey,
+	}
+
+	sendCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	batch, err := p.client.NewEventDataBatch(sendCtx, batchOptions)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create event batch: %v", err)
+	}
+
+	// Convert SKU events to Event Hub events
+	for i, event := range events {
+		// Serialize to JSON
+		jsonData, err := json.Marshal(event)
+		if err != nil {
+			return 0, fmt.Errorf("failed to marshal event data for event %d: %v", i+1, err)
+		}
+
+		// Create Event Hub event
+		eventData := &azeventhubs.EventData{
+			Body: jsonData,
+		}
+
+		if err := batch.AddEventData(eventData, nil); err != nil {
+			return 0, fmt.Errorf("failed to add event %d to batch: %v", i+1, err)
+		}
+	}
+
+	if err := p.client.SendEventDataBatch(sendCtx, batch, nil); err != nil {
+		return 0, fmt.Errorf("failed to send events: %v", err)
+	}
+
+	return len(events), nil
+}
+
+// Close closes the Event Hub producer client
+func (p *EventHubProducer) Close(ctx context.Context) error {
+	return p.client.Close(ctx)
+}
+
 // runEventGenerator runs the event generation loop for a single goroutine
-func runEventGenerator(ctx context.Context, client *azeventhubs.ProducerClient, config *Config, ccpID string) {
+func runEventGenerator(ctx context.Context, producer EventProducer, config *Config, ccpID string) {
 	ticker := time.NewTicker(time.Duration(config.IntervalSeconds) * time.Second)
 	defer ticker.Stop()
 
@@ -279,7 +372,7 @@ func runEventGenerator(ctx context.Context, client *azeventhubs.ProducerClient, 
 			log.Printf("DEBUG: CCP %s - Starting iteration %d at %v", ccpID, iterationCount, tick.Format(time.RFC3339))
 
 			iterationStart := time.Now()
-			eventCount, err := generateAndSendEvents(ctx, client, ccpID)
+			eventCount, err := generateAndSendEvents(ctx, producer, ccpID)
 			iterationDuration := time.Since(iterationStart)
 
 			if err != nil {
@@ -303,7 +396,7 @@ func runEventGenerator(ctx context.Context, client *azeventhubs.ProducerClient, 
 }
 
 // generateAndSendEvents generates a random number of SKU events and sends them to Event Hub
-func generateAndSendEvents(ctx context.Context, client *azeventhubs.ProducerClient, ccpID string) (int, error) {
+func generateAndSendEvents(ctx context.Context, producer EventProducer, ccpID string) (int, error) {
 	// Choose a random number of SKU families (1 to 100)
 	numSkus := rand.Intn(100) + 1
 	log.Printf("DEBUG: CCP %s - Generating %d events", ccpID, numSkus)
@@ -319,11 +412,11 @@ func generateAndSendEvents(ctx context.Context, client *azeventhubs.ProducerClie
 		log.Printf("DEBUG: CCP %s - ... and %d more SKU families", ccpID, len(selectedSkus)-5)
 	}
 
-	// Create events with CCP ID as partition key (all events from this CCP go to same partition)
-	events := make([]*azeventhubs.EventData, 0, numSkus)
+	// Create SKU events
+	events := make([]SKUEvent, 0, numSkus)
 	eventCreationStart := time.Now()
 
-	for i, skuFamily := range selectedSkus {
+	for _, skuFamily := range selectedSkus {
 		// Generate random core count (0 to 100)
 		cores := rand.Intn(101)
 
@@ -335,67 +428,33 @@ func generateAndSendEvents(ctx context.Context, client *azeventhubs.ProducerClie
 			CcpId:     ccpID,
 		}
 
-		// Serialize to JSON
-		jsonData, err := json.Marshal(eventData)
-		if err != nil {
-			log.Printf("ERROR: CCP %s - Failed to marshal event %d: %v", ccpID, i+1, err)
-			return 0, fmt.Errorf("failed to marshal event data for event %d: %v", i+1, err)
-		}
-
-		// Create Event Hub event
-		event := &azeventhubs.EventData{
-			Body: jsonData,
-		}
-
-		events = append(events, event)
+		events = append(events, eventData)
 	}
 
 	eventCreationDuration := time.Since(eventCreationStart)
 	log.Printf("DEBUG: CCP %s - Created %d events for single partition (took %v)",
 		ccpID, numSkus, eventCreationDuration)
 
-	// Send events in a single batch using CCP ID as partition key
-	log.Printf("DEBUG: CCP %s - Starting batch send operation with CCP ID as partition key...", ccpID)
+	// Send events using the producer interface
+	log.Printf("DEBUG: CCP %s - Starting send operation with CCP ID as partition key...", ccpID)
 	sendStart := time.Now()
+
+	// Create timeout context
 	sendCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	batchStart := time.Now()
-	log.Printf("DEBUG: CCP %s - Creating batch for partition key '%s' with %d events", ccpID, ccpID, len(events))
-
-	// Create batch with CCP ID as partition key
-	batchOptions := &azeventhubs.EventDataBatchOptions{
-		PartitionKey: &ccpID,
-	}
-	batch, err := client.NewEventDataBatch(sendCtx, batchOptions)
+	// Send events using the producer interface
+	sentCount, err := producer.SendEvents(sendCtx, events, ccpID)
 	if err != nil {
-		log.Printf("ERROR: CCP %s - Failed to create batch for partition '%s': %v", ccpID, ccpID, err)
-		return 0, fmt.Errorf("failed to create event batch for partition %s: %v", ccpID, err)
+		log.Printf("ERROR: CCP %s - Failed to send events: %v", ccpID, err)
+		return 0, fmt.Errorf("failed to send events: %v", err)
 	}
-
-	for j, event := range events {
-		err := batch.AddEventData(event, nil)
-		if err != nil {
-			log.Printf("ERROR: CCP %s - Failed to add event %d to batch for partition '%s': %v", ccpID, j+1, ccpID, err)
-			return 0, fmt.Errorf("failed to add event to batch for partition %s: %v", ccpID, err)
-		}
-	}
-
-	if err := client.SendEventDataBatch(sendCtx, batch, nil); err != nil {
-		log.Printf("ERROR: CCP %s - Failed to send batch for partition '%s': %v", ccpID, ccpID, err)
-		return 0, fmt.Errorf("failed to send events for partition %s: %v", ccpID, err)
-	}
-
-	batchDuration := time.Since(batchStart)
-	totalSent := len(events)
-	log.Printf("DEBUG: CCP %s - Partition '%s' sent successfully: %d events (took %v)",
-		ccpID, ccpID, len(events), batchDuration)
 
 	sendDuration := time.Since(sendStart)
-	log.Printf("SUCCESS: CCP %s - Batch send completed: %d events to single partition (took %v)",
-		ccpID, totalSent, sendDuration)
+	log.Printf("SUCCESS: CCP %s - Send completed: %d events to partition '%s' (took %v)",
+		ccpID, sentCount, ccpID, sendDuration)
 
-	return totalSent, nil
+	return sentCount, nil
 }
 
 // min returns the minimum of two integers

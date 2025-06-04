@@ -1,15 +1,19 @@
 # Event Hub to ASA POC
 
-This Go application creates a configurable number of goroutines that generate and send events to Azure Event Hub. Each goroutine randomly selects SKU family names and core counts, then sends these as events to Event Hub using the latest Azure SDK.
+> **IMPORTANT NOTICE:** This application is partially vibe coded and is NOT intended for production use. It serves as a proof of concept only and should not be deployed in any production environment.
+
+This Go application creates a configurable number of goroutines that generate and send events to Azure Event Hub. Each goroutine randomly selects SKU family names and core counts, then sends these as events to Event Hub using either AMQP (default) or Kafka protocol with Managed Service Identity (MSI) authentication.
 
 ## Features
 
-- **Modern Azure SDK**: Uses `github.com/Azure/azure-sdk-for-go/sdk/messaging/azeventhubs` for optimal performance
+- **Dual Protocol Support**:
+  - **AMQP**: Uses `github.com/Azure/azure-sdk-for-go/sdk/messaging/azeventhubs` for optimal performance
+  - **Kafka**: Uses `github.com/confluentinc/confluent-kafka-go/v2/kafka` for Kafka API compatibility
+- **MSI Authentication**: Both protocols use Azure Default Credentials for secure authentication
 - **Configurable Goroutines**: Set the number of concurrent goroutines via environment variables
 - **Random Event Generation**: Each goroutine randomly selects 1-100 SKU families and assigns 0-100 cores
 - **Unique CCP Identification**: Each goroutine is assigned a unique GUID (CCP ID) for event tracking
-- **Azure Default Credentials**: Secure authentication using Azure Default Credential chain
-- **Intelligent Partitioning**: Groups events by SKU family as partition keys for better distribution
+- **Consistent Partitioning**: Uses CCP ID as partition key to ensure events from the same CCP go to the same partition
 - **Batch Processing**: Events are sent in batches for optimal performance
 - **Graceful Shutdown**: Handles interrupt signals and stops gracefully
 - **Structured Logging**: Clear logging for monitoring and debugging
@@ -19,10 +23,19 @@ This Go application creates a configurable number of goroutines that generate an
 Copy `.env.example` to `.env` and configure the following variables:
 
 ```bash
-# Required: Event Hub namespace (FQDN format)
+# Optional: Set to "true" to use Kafka protocol instead of AMQP
+USE_KAFKA=false
+
+# AMQP Protocol Configuration (default)
+# Required when USE_KAFKA=false: Event Hub namespace (FQDN format)
 EVENT_HUB_NAMESPACE=your-eventhub-namespace.servicebus.windows.net
 
-# Required: Event Hub name
+# Kafka Protocol Configuration
+# Required when USE_KAFKA=true: Kafka broker endpoint this assumes port 9093
+KAFKA_BROKER=your-eventhub-namespace.servicebus.windows.net
+
+# Common Configuration
+# Required: Event Hub name (used as topic name for Kafka)
 EVENT_HUB_NAME=your-event-hub-name
 
 # Optional: Number of goroutines (default: 5)
@@ -169,6 +182,18 @@ The application has been refactored to use the latest Azure Event Hubs SDK:
 - ✅ Timeout contexts for operations
 - ✅ Batch processing for efficiency
 - ✅ Secure authentication credential chain
+
+## Disclaimer
+
+This application is a proof of concept (POC) that includes "vibe coded" portions, meaning some parts were written based on intuition and pattern matching rather than extensive testing. As such:
+
+- ⚠️ The code may contain bugs or inefficient implementations
+- ⚠️ Error handling might not be comprehensive in all scenarios
+- ⚠️ The OAuth token refresh implementation for Kafka is experimental
+- ⚠️ Some configuration combinations have not been thoroughly tested
+- ⚠️ Performance characteristics have not been optimized for scale
+
+**DO NOT** use this application in production environments without comprehensive review, testing, and hardening.
 
 ## SKU Families
 
